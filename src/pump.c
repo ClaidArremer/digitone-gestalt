@@ -7,6 +7,11 @@
  * A levelling amplifier first, a compressor second: turn it on and the mix
  * comes up louder, denser and glued, and the drums breathe with the beat.
  *
+ * PUMP 4.0: RADS (rads.c) runs before it in one chain (pm_insert, below). The
+ * page sets CMP from COMP (OFF: the compressor fades out), RAT, REL and OUT;
+ * ATK is fixed at 6, WRM at 0 and MIX at fully wet (their code is kept). OUT
+ * works with the compressor off, a gain alone.
+ *
  *   ATK  (B)  punch: each hit's front gets through untouched for 0 .. 15 ms
  *             before the gain comes down (an attack hold, then the 0.5 ms
  *             attack); the body is pumped as before. The ceiling holds peaks.
@@ -50,14 +55,16 @@
 
 /* The parameters (pumpctl.c edits them and stores them per pattern), 0..127,
  * one step a notch, the stock convention. */
-int digipump_on = 0;
-int digipump_squash = 64;           /* CMP */
-int digipump_pump = 64;             /* REL: mid = GLUE */
-int digipump_warm = 32;             /* WRM */
-int digipump_mix = 127;             /* MIX */
-int digipump_atk = 0;               /* ATK */
-int digipump_out = 64;              /* OUT: 64 = 0 dB */
+int digipump_on = 1;                /* COMP above OFF (pumpctl.c sets it from COMP) */
+int digipump_squash = 80;           /* COMP */
+int digipump_pump = 63;             /* REL: stored as 127 - the knob; mid = GLUE */
+int digipump_warm = 0;              /* WRM: gone in 4.0 (RADS's tables took its place), fixed 0 */
+int digipump_mix = 127;             /* MIX: gone in 4.0, fixed fully wet */
+int digipump_atk = 6;               /* ATK: gone from the page in 4.0, fixed at 6 */
+int digipump_out = 64;              /* OUT: 64 = 0 dB; on RADS and the compressor alike */
 int digipump_rat = 0;               /* RAT: 0 AUTO (CMP sets it), 1..126 2:1..20:1, 127 limit */
+int digipump_meter;                 /* the page wants the output level (digipump_lvl) */
+int digipump_lvl;                   /* the output's peak since the page last read it (24 bits) */
 int digipump_gr;                    /* live gain reduction, lu (page meter) */
 int digipump_grpk;                  /* its peak since the page last read it */
 
@@ -71,7 +78,6 @@ static int pm_wet;                  /* 0..4096: the on/off crossfade */
 static int pm_ef, pm_es;            /* fast / slow gain reduction, lu Q12 */
 static int pm_g = 4096;             /* gain applied at the end of last block */
 static int pm_hold, pm_held;        /* ATK: blocks left to hold; a hit is under way */
-static int pm_gfold;                /* pm_g has OUT folded in (no WRM last block) */
 
 /* OUT: 0..127 -> lu: 64 = 0 dB, 0 = -32 dB (0.5 dB a step), 127 = +6 dB */
 static int pm_out_lu(int v)
@@ -137,21 +143,6 @@ static inline int pm_step(int e, int t, int c)
     return e + (((t - e) >> 9) * c >> 6);
 }
 
-/* WARM's soft clipper on one 24-bit input sample x, gd the gain times the
- * drive (Q12): v = x * gd in 16 bits (full scale 32767; its rounding
- * ~-96 dB, under the grit), y = (3 v - v^3) / 2, held at full scale beyond.
- * 3 multiplies, the gain's included. */
-static inline int pm_warm(int x, int gd)
-{
-    int v = ((x >> 8) * (gd >> 4)) >> 8, c;     /* < 2^15 * 2^15 */
-    if (v >= 32767)
-        return 0x7fff00;
-    if (v <= -32767)
-        return -0x7fff00;
-    c = (((v * v) >> 15) * v) >> 15;                    /* v^3 */
-    return (3 * v - c) << 7;                            /* /2, back to 24 bits */
-}
-
 /* A state-variable filter (Chamberlin): low += f band; high = x - low - q band;
  * band += f high. q = 1.5 (Q 0.67, near Butterworth). The corner is picked so f is
  * made of shifts, no multiplies (this runs on every sample): FS(b) is f * b.
@@ -162,7 +153,7 @@ static inline int name(struct pm_svf *st, int x)                               \
 {                                                                              \
     int hi, b = st->bd;                                                        \
     st->lo += FS(b);                                                           \
-    hi = (x << 4) - st->lo - b - (b >> 1);    /* q = 1.5 (Q 0.67) */            \
+    hi = x * 16 - st->lo - b - (b >> 1);      /* q = 1.5 (Q 0.67) */            \
     st->bd = b + FS(hi);                                                       \
     return hi >> 4;                                                            \
 }
@@ -176,40 +167,96 @@ PM_SVF(pm_hp30, PM_F30)
  * hard-panned sound counts as before. Shifts and adds only. */
 static struct pm_svf pm_hp;
 static int pm_peak;                         /* last block's level, for this one */
-static inline int pm_detect(int l, int r)
+static inline int pm_detect(struct pm_svf *hp, int l, int r)
 {
-    int m = pm_hp30(&pm_hp, (l + r) >> 1), sd = (l - r) >> 1;
+    int m = pm_hp30(hp, (l + r) >> 1), sd = (l - r) >> 1;
     if (m < 0) m = -m;
     if (sd < 0) sd = -sd;
     return m + sd;
 }
 
+/* fully off: the compressor starts clean next time */
+static void pm_clean(void)
+{
+    if (pm_ef || pm_es || pm_hp.lo || pm_hp.bd || pm_peak || digipump_gr) {
+        pm_ef = pm_es = 0;
+        pm_hp.lo = pm_hp.bd = 0;
+        pm_peak = 0;
+        digipump_gr = 0;
+    }
+}
+
 /* One 32-frame block, one pass: core's input (Q1.31) in, the output (Q1.31)
  * out. The gain comes from the last block's level (0.67 ms before); the
  * detector reads this block's on the way through, for the next. */
+/* The block's frames (GESTALT 4.4): the gain ramped from g by dg a frame over the first nr, each
+ * channel times it (24-bit x, Q12 g, split so no product passes 32 bits), the ceiling; and the
+ * detector a frame in two. Returns the block's detected peak. pumploop.s is the same in assembly. */
+#if defined(__mcoldfire__) && !defined(PM_C_LOOP)
+int pm_frames_asm(const int32_t *in, int32_t *out, int g, int dg, int nr, struct pm_svf *hp);
+#define pm_frames pm_frames_asm
+#else
+static int pm_frames(const int32_t *in, int32_t *out, int g, int dg, int nr, struct pm_svf *hp)
+{
+    int i, peak = 0;
+    for (i = 0; i < DN_OUT_FRAMES; i++) {
+        int x0 = in[0] >> 8, x1 = in[1] >> 8, l, r;
+        if (i < nr)
+            g += dg;
+        if (!(i & 1)) {
+            int d = pm_detect(hp, x0, x1);
+            if (d > peak) peak = d;
+        }
+        l = (x0 >> 12) * g + (((x0 & 0xfff) * g) >> 12);
+        r = (x1 >> 12) * g + (((x1 & 0xfff) * g) >> 12);
+        out[0] = (int32_t)((uint32_t)pm_ceil(l) << 8);
+        out[1] = (int32_t)((uint32_t)pm_ceil(r) << 8);
+        in += 2;
+        out += 2;
+    }
+    return peak;
+}
+#endif
+
 static void pm_block(const int32_t *in, int32_t *out)
 {
     int i, peak, lvl, over, gr, grt, gr_s, w, s, thr, mk;
-    int g, gm, dg, nr, mixw, k, og, fold;
+    int g, gm, dg, nr, mixw, og;
     int sq = digipump_squash, pmp = digipump_pump;
 
-    /* the on/off crossfade; fully off and settled: true bypass */
+    /* the on/off crossfade; fully off and settled with OUT at 0 dB: true bypass. OUT is not
+     * the compressor's: it stays with COMP OFF, for RADS */
     if (digipump_on) {
         if (pm_wet < 4096)
             pm_wet += PM_RAMP;
     } else if (pm_wet > 0) {
         pm_wet -= PM_RAMP;
-    } else {
-        if (pm_g != 4096 || pm_ef || pm_es || pm_hp.lo || pm_hp.bd) {
-            pm_g = 4096;                                /* start clean next time */
-            pm_gfold = 1;
-            pm_ef = pm_es = 0;
-            pm_hp.lo = pm_hp.bd = 0;
-            pm_peak = 0;
-            digipump_gr = 0;
-        }
+    } else if (digipump_out == 64 && pm_g == 4096) {
+        pm_clean();
         for (i = 0; i < 2 * DN_OUT_FRAMES; i++)        /* settled: as it came */
             out[i] = in[i];
+        return;
+    } else {
+        /* COMP OFF (and faded out), OUT not 0 dB, or on its way back: the level alone, ramped
+         * over the block; no detector, the compressor starts clean when COMP comes back */
+        int go = digipump_out == 64 ? 4096 : pm_exp2(pm_out_lu(digipump_out));
+        g = pm_g;
+        dg = (go - g) >> 5;
+        for (i = 0; i < DN_OUT_FRAMES; i++) {
+            int x0 = in[0] >> 8, x1 = in[1] >> 8, l, r;
+            g += dg;
+            l = (x0 >> 12) * g + (((x0 & 0xfff) * g) >> 12);
+            r = (x1 >> 12) * g + (((x1 & 0xfff) * g) >> 12);
+            out[0] = (int32_t)((uint32_t)pm_ceil(l) << 8);
+            out[1] = (int32_t)((uint32_t)pm_ceil(r) << 8);
+            in += 2;
+            out += 2;
+        }
+        pm_g = go;
+        pm_ef = pm_es = 0;
+        pm_hp.lo = pm_hp.bd = 0;
+        pm_peak = 0;
+        digipump_gr = 0;
         return;
     }
 
@@ -274,23 +321,14 @@ static void pm_block(const int32_t *in, int32_t *out)
     mixw = (mixw * pm_wet) >> 12;
     gm = 4096 + (((g - 4096) * mixw) >> 12);
 
-    /* OUT, faded in and out with PUMP. With no WRM it folds into the gain
-     * (free); with WRM it comes after the grit (a multiply a sample) */
-    k = (digipump_warm * mixw) / 127;                   /* WRM, faded: 0..4095 */
+    /* OUT folds into the gain (free; 4.4: no WRM, so always) */
     og = digipump_out == 64 ? 4096 : pm_exp2(pm_out_lu(digipump_out));
-    og = 4096 + (((og - 4096) * pm_wet) >> 12);
-    fold = k <= 0;
-    if (fold)
-        gm = (gm * og) >> 12;
+    gm = (gm * og) >> 12;
 
     /* ramp from last block's gain to this one: across the 32 frames when it
      * rises (release: smooth), across the first 8 when it falls (attack: the
-     * block's own peak is caught before it reaches the ceiling). WRM on or
-     * off since: last block's gain into this block's terms first. */
+     * block's own peak is caught before it reaches the ceiling) */
     g = pm_g;
-    if (fold != pm_gfold)
-        g = fold ? (g * og) >> 12 : (g << 12) / og;
-    pm_gfold = fold;
     if (gm < g) {
         nr = 8;
         dg = (gm - g) >> 3;
@@ -301,55 +339,10 @@ static void pm_block(const int32_t *in, int32_t *out)
     pm_g = gm;
 
 
-    if (k <= 0) {
-        for (i = 0; i < DN_OUT_FRAMES; i++) {
-            if (i < nr)
-                g += dg;
-            int x0 = in[0] >> 8, x1 = in[1] >> 8;
-            if (!(i & 1)) {
-                int d = pm_detect(x0, x1);
-                if (d > peak) peak = d;
-            }
-            int l = (x0 >> 12) * g + (((x0 & 0xfff) * g) >> 12);
-            int r = (x1 >> 12) * g + (((x1 & 0xfff) * g) >> 12);
-            out[0] = (int32_t)((uint32_t)pm_ceil(l) << 8);
-            out[1] = (int32_t)((uint32_t)pm_ceil(r) << 8);
-            in += 2;
-            out += 2;
-        }
-    } else {
-        /* Drive D (Q12) from 2/3 at k = 0 to 8/3 at full WARM (+12 dB) into
-         * f(v) = 1.5 v - 0.5 v^3, |v| <= 1 (v = D x / full scale; f(1) = 1,
-         * flat there), held at +-1 beyond: y = f(v) / (1.5 * 2/3) = f(v), so
-         * small signals gain 1.5 D (1x .. 4x) while the peaks are held at full
-         * scale for the ceiling. The linear part runs at full precision from
-         * the 24-bit sample, the cubic correction from v's 16 bits: 6
-         * multiplies per channel. */
-        int dq = 2731 + 2 * k;                          /* 2/3 .. 8/3, Q12 */
-        /* the gain folds into the drive: gd = g * D (Q12, < 2^19), ramped
-         * with g; v = x * gd in 16 bits, then the clipper: 3 multiplies */
-        int gd = (int)(((g >> 4) * dq) >> 8), gdd = (int)(((dg >> 4) * dq) >> 8);
-        for (i = 0; i < DN_OUT_FRAMES; i++) {
-            int x0 = in[0] >> 8, x1 = in[1] >> 8, l, r;
-            if (!(i & 1)) {
-                int d = pm_detect(x0, x1);
-                if (d > peak) peak = d;
-            }
-            if (i < nr)
-                gd += gdd;
-            l = pm_warm(x0, gd);
-            r = pm_warm(x1, gd);
-            if (og != 4096) {                           /* OUT, after the grit */
-                l = ((l >> 8) * og) >> 4;
-                r = ((r >> 8) * og) >> 4;
-            }
-            out[0] = (int32_t)((uint32_t)pm_ceil(l) << 8);
-            out[1] = (int32_t)((uint32_t)pm_ceil(r) << 8);
-            in += 2;
-            out += 2;
-        }
-    }
+    peak = pm_frames(in, out, g, dg, nr, &pm_hp);
     pm_peak = peak;
+    if (!pm_wet)
+        pm_clean();                                     /* faded out */
 }
 
 /* core-dn1 4.0's insert audio. Core hands us what the master stage
@@ -359,16 +352,57 @@ static void pm_block(const int32_t *in, int32_t *out)
  * so the shift back up cannot overflow. */
 #include "digitone-mk1/core3.h"
 
+/* PUMP 4.0: RADS, then the compressor, in one chain. RADS runs while TABLE is not OFF (and
+ * until its blend has faded out), PUMP while COMP is not OFF or OUT is not 0 dB (and until it has
+ * faded out); with both off, core plays the stage's output as is. */
+void digifold_block(const int32_t *in, int32_t *out);
+int digifold_sync(void);            /* the folder wants the insert, or is still fading out */
+static volatile int pm_rads;        /* the folder is in the chain (from the UI task) */
+static int32_t pm_buf[2 * DN_OUT_FRAMES];
+
+static int pm_idle(void)
+{
+    return !digipump_on && pm_wet == 0 && digipump_out == 64 && pm_g == 4096;
+}
+
+/* the output's level for the page's bouncing table: a frame in four, while it is shown */
+static void pm_level(const int32_t *o)
+{
+    int i, pk = digipump_lvl;
+    for (i = 0; i < 2 * DN_OUT_FRAMES; i += 8) {
+        int l = o[i] >> 8, r = o[i + 1] >> 8;
+        if (l < 0) l = -l;
+        if (r < 0) r = -r;
+        if (l > pk) pk = l;
+        if (r > pk) pk = r;
+    }
+    digipump_lvl = pk;
+}
+
 static void pm_insert(int32_t *out, const int32_t *in)
 {
-    pm_block(in, out);
+    if (pm_rads) {
+        if (pm_idle()) {
+            pm_clean();
+            digifold_block(in, out);
+        } else {
+            digifold_block(in, pm_buf);
+            pm_block(pm_buf, out);
+        }
+    } else {
+        pm_block(in, out);
+    }
+    if (digipump_meter)
+        pm_level(out);
 }
 
 struct core_audio_owner digipump_owner = { 0, pm_insert, CORE_AUDIO_INSERT };
 
-/* From the UI task, every frame: hold the insert while PUMP is on or still
- * fading out; once it is off and faded, core plays the stage's output as is. */
+/* From the UI task, every frame: hold the insert while PUMP or RADS is on or still fading out;
+ * once both are off and faded, core plays the stage's output as is. */
 void digipump_owner_sync(void)
 {
-    digipump_owner.on = digipump_on || pm_wet > 0;
+    int rads = digifold_sync();
+    pm_rads = rads;
+    digipump_owner.on = !pm_idle() || rads;
 }

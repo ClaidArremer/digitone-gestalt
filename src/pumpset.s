@@ -1,11 +1,12 @@
 | SPDX-License-Identifier: GPL-2.0-or-later
-| PUMP's SETTINGS row: PUMP ANIMATION, a checkbox. Ticked (the default), the
-| PUMP page animates (the turning record, the graph); unticked, it stays
-| still and draws twice a second. The row's four callbacks follow the
-| SETTINGS menu's MenuItem conventions as digihealth's SYSTEM INFO row does
+| PUMP's SETTINGS row, FX ANIMATION, a checkbox: ticked (the default), the
+| page animates (the bouncing table, the meter, the graph); unticked, it stays
+| still and draws twice a second. The row's four callbacks follow the SETTINGS
+| menu's MenuItem conventions as digihealth's SYSTEM INFO row does
 | (irpina/digihealth, sysinfo.s, GPL-2.0-or-later), from which they are
 | adapted. The choice lives in pumpctl_anim_off (byte 0: 0 animate, 1 still),
-| which pumpctl.c saves with the project.
+| which pumpctl.c saves with the project. (PUMP 3.0's MASTER FX row is gone:
+| PUMP 4.0 is RADS and the compressor in one chain.)
 
         .ifdef  DN144                   | the Digitone mk1 1.44 (mod.json's port)
         .equ STR_CTOR,    0x4018afc8    | std::string(this, const char*, alloc&)
@@ -21,7 +22,7 @@
 
         .section .run, "ax"
 
-| ev_settings handler: the row, after the stock ones (and SYSTEM INFO's)
+| ev_settings handler: the rows, after the stock ones (and SYSTEM INFO's)
         .globl  pumpset_settings
 pumpset_settings:
         pea     ps_row
@@ -91,5 +92,5 @@ ps_draw:
 
         .balign 4
 ps_row: .long   ps_label, ps_select, ps_draw, ps_change
-ps_str: .asciz  "PUMP ANIMATION"
+ps_str: .asciz  "FX ANIMATION"
         .balign 4

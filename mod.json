@@ -1,20 +1,24 @@
 {
  "id": "pump",
- "version": "2.12",
- "title": "PUMP (master compressor)",
+ "version": "5.2",
+ "title": "GESTALT (a wavefolder into PUMP, an SP-303 style compressor)",
  "category": "Sound",
  "author": "Robbie (master page plumbing adapted from Tone+FX by Digital Alchemy DSP; SETTINGS row adapted from digihealth by irpina)",
  "license": "GPL-2.0-or-later",
- "description": "PUMP, an SP-303 Vinyl Sim-style levelling compressor on everything the Digitone plays, with its own master page (FUNC+LFO, then LEFT/RIGHT to the page after the stock ones). A = on/off; B = ATK: punch, each hit's front gets through before the gain comes down; C = OUT: output level before the ceiling, -32 to +6 dB, for headroom; D = RAT: the ratio, AUTO (set by CMP), 2:1 to 20:1 or LIMIT; E = CMP: threshold, ratio and automatic make-up together, so more is always louder and denser; F = REL: release, more is slower: from PUMP (fast, breathing) through GLUE to LEVEL (slow levelling); G = WRM: soft saturation; H = MIX: parallel blend. The page: a record that turns with the tempo, a tonearm that rides in with the gain reduction, the eight controls with values and a gain-reduction meter; YES swaps the record for a graph of the last 2.8 s of gain reduction (FUNC + YES is the stock TEMP SAVE); SETTINGS > PUMP ANIMATION turns the animation off (~1% less CPU), saved with the project. Always on: a 30 Hz high-pass in the compressor's detector, so inaudible sub-bass does not eat into the pump (the output keeps it). Press and turn a knob for big steps. Settings are stored per pattern. Off it costs nothing; on, a few percent of the processor (more with WRM). It runs as core-dn1 4.0's insert audio, so it is on every output: main outs, headphones and USB. Its own output ceiling keeps the make-up gain from clipping. Standalone: not with Tone+FX, which owns the same master page hook.",
+ "description": "GESTALT 5.2 for Digitone: a wavefolder into PUMP, an SP-303 Vinyl Sim-style levelling compressor, on everything the Digitone plays, on its own master page (FUNC+LFO, then LEFT/RIGHT to the page after the stock ones). A = FOLD: OFF, then the drive, from soft saturation to many folds; B = SHAPE: the fold's curve, morphing SINE, TRI, SQR, STEP, RIPL, WRAP, LEAN; C = TONE: a low-pass after the folder, 300 Hz to 16 kHz, OPEN; D = TOUCH: the drive follows the input's level (+ loud parts fold harder, - quiet parts), OFF in the middle; E = COMP: OFF, then threshold, ratio and make-up together; F = RATIO: AUTO, 2:1 to 20:1, LIMIT; G = REL: PUMP through GLUE to LEVEL; H = OUT: the chain's output, -32 to +6 dB. The folder has a fixed trim by FOLD; a 30 Hz high-pass in the detector; a soft limiter. Its page: the fold curve, bouncing with the output's level, the eight controls with units and a gain-reduction meter; YES cycles the big curve and a graph of the last 2.8 s of gain reduction. Press and turn for big steps; FUNC + turn snaps; FUNC + REC / STOP / PLAY copies, pastes, clears. SETTINGS > FX ANIMATION stills the page. Settings per pattern. With FOLD OFF, COMP OFF and OUT 0 dB it costs nothing. Core-dn1 4.0's insert audio: on every output, main outs, headphones and USB.",
  "device": "digitone-mk1",
  "os": "1.43",
  "sources": [
   "src/pump.c",
+  "src/fold.c",
+  "src/foldloop.s",
+  "src/pumploop.s",
   "src/pumpctl.c",
   "src/pumpset.s"
  ],
  "cflags": [
-  "-DPUMP_CEILING"
+  "-DPUMP_CEILING",
+  "-fno-auto-inc-dec"
  ],
  "sites": [
   {
@@ -42,7 +46,8 @@
     "-DDN_PAT_PTR=0x4138F214",
     "-DDN_MASTER_VT=0x40199EFC",
     "-DDN_FBP_ADDR=0x40241e44",
-    "-DPC_MIRROR"
+    "-DPC_MIRROR",
+    "-fno-auto-inc-dec"
    ],
    "sites": [
     {
@@ -116,7 +121,7 @@
  "resources": {
   "names": [
    "ui:master page PUMP",
-   "settings:PUMP ANIMATION",
+   "settings:FX ANIMATION",
    "projdata:PMPU"
   ],
   "core": "4.0"

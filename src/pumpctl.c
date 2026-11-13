@@ -1,20 +1,20 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- * pumpctl: the PUMP master page. Digitone mk1 / Keys, OS 1.43 and 1.44.
- * By Robbie; the master-page plumbing is adapted from Tone+FX (below).
+ * pumpctl: the GESTALT master page (5.0 on: a wavefolder and PUMP; the mod's id stays pump).
+ * Digitone mk1 / Keys, OS 1.43 and 1.44. By Robbie; the master-page plumbing is adapted from
+ * Tone+FX (below).
  *
- * One page of our own appended to the stock master pages (FUNC + LFO, then
- * LEFT / RIGHT): the SP-303 Vinyl Sim-style levelling compressor in pump.c.
+ * One page of our own appended to the stock master pages (FUNC + LFO, then LEFT / RIGHT). GESTALT
+ * From 5.0 it is one chain: a wavefolder (fold.c), then the SP-303 Vinyl Sim-style compressor (pump.c).
  *
- *   A = on/off, B = ATK (punch), C = OUT (level, in dB), D = RAT (ratio);
- *   E = CMP, F = REL (LEVEL / GLUE / PUMP), G = WRM, H = MIX.
- *   Press a knob and turn it for big steps; FUNC + turn jumps to an end.
+ *   A = FOLD (OFF, then the drive), B = SHAPE (the fold's curve), C = TONE (a low-pass after the
+ *   folder, OPEN at the top), D = TOUCH (the drive follows the input's level, either way); E = COMP (OFF, then the compressor), F = RATIO,
+ *   G = REL, H = OUT (the chain's level, in dB). Press a knob and turn it for big steps; FUNC +
+ *   turn: each knob's snap points.
  *
- * The page: a record that turns a bar a turn at the sequencer's tempo (still
- * when it stops), a tonearm that rides in with the gain reduction, the four
- * sliders with their values, and a gain-reduction meter (2 dB segments, a
- * peak tick held 1 s). YES swaps the record for a graph of the last 2.8 s of
- * gain reduction. SETTINGS > PUMP ANIMATION unticked: no animation and no
- * meter (the name and the controls, redrawn twice a second; ~1% of the CPU less).
+ * The page: a small screen with the fold curve (OFF with FOLD OFF), bouncing with the output's
+ * level, so the compressor's pump shows; the eight controls with their values; a gain-reduction
+ * meter. YES: the curve across the page, then a graph of the last 2.8 s of gain reduction.
+ * SETTINGS > FX ANIMATION unticked: no animation and no meter.
  *
  * The page plumbing is adapted from Tone+FX's digictl (Digital Alchemy DSP,
  * GPL-2.0-or-later), cut down to this one page: the master view (vtable DN_MASTER_VT)
@@ -22,10 +22,9 @@
  * we append one kind and take the view's draw slot. Kind 0 is the value
  * Tone+FX's first page has always used with the stock draw. Settings live in
  * the saved pattern (the third MIDI track's unused 64-byte block, magic
- * "DPM1"), so
- * they follow pattern switches and project saves like stock parameters.
+ * "DPM1"), so they follow pattern switches and project saves like stock
+ * parameters.
  */
-#include "pump_sin.h"
 #include "digitone-mk1/core3.h"   /* fw_tempo, fw_transport */
 
 #ifndef DN_TEXTF_ADDR
@@ -103,37 +102,56 @@
 #define DC_ACT_TICKS  20           /* frames a moved slider shows its value */
 #define DG_TOP        53           /* rows 53..63 are the stock status bar */
 
-extern int digipump_on, digipump_squash, digipump_pump, digipump_warm, digipump_mix;
-extern int digipump_atk, digipump_out, digipump_rat;
-extern int digipump_gr;
+extern int digipump_on, digipump_squash, digipump_pump;
+extern int digipump_out, digipump_rat, digipump_gr;
+extern int digipump_meter, digipump_lvl;
+extern struct core_audio_owner digipump_owner;
 void digipump_owner_sync(void);
+extern int digifold_amt, digifold_shape, digifold_tone, digifold_touch, digifold_active;
+extern int digifold_gq, digifold_wm;
+extern const short *const digifold_sin;
+#include "fold_data.h"
 
 static int clampi(int v, int lo, int hi)
 {
     return v < lo ? lo : v > hi ? hi : v;
 }
 
+/* the page's own two: COMP (0 OFF, else the compressor's CMP) and FOLD (0 OFF, else
+ * the drive); pumpctl_tick hands them to pump.c and fold.c */
+static int hy_comp = 80, hy_fold;
+
 /* ---- per-pattern storage -----------------------------------------------------
  * The patterns are a 0x1611D-byte struct array at DN_PAT_BASE; *DN_PAT_PTR is
  * the current one. Each MIDI track leaves a 64-byte block unused at
  * track_t+0x100; Tone+FX keeps its settings in MIDI tracks 0 and 1's
  * (+0x1040, +0x1410), so we take MIDI track 2's (+0x17E0) and never touch
- * theirs: projects saved under Tone+FX keep its settings. */
+ * theirs: projects saved under Tone+FX keep its settings.
+ * v6 (GESTALT 5.2): the eight controls as the knobs sit, A..H (FOLD SHAPE TONE TOUCH
+ * COMP RATIO REL OUT). v5 (5.0, 5.1: FOLD BIAS TONE BLEND, then the same four): FOLD, TONE and
+ * the compressor's four are taken, SHAPE and TOUCH start at SINE and off. v4 (4.0 .. 4.5): RADS's four, then the same compressor four:
+ * those are taken, the folder starts OFF. v1..v3 (PUMP 1.0 ..
+ * 3.0) carry the compressor's own: ON, CMP, REL, WRM, MIX, ATK, OUT, RAT (v1 the
+ * first five, v2 seven); COMP, REL, OUT and RAT are taken from them (PUMP off:
+ * COMP OFF), the folder's start from their defaults (FOLD OFF). PUMP 3.0's RADS
+ * settings (the block's second half, "RDS1") are left as they were. */
 #define DN_PAT_STRIDE 0x1611Du
 #define DN_PAT_SLOTS  128u
 #define PC_STORE_OFF  0x17E0u
 #define PC_STORE_N    8
-#define PC_STORE_VER  3
+#define PC_STORE_VER  6
 #define PC_STORE_LEN  (8 + 2 * PC_STORE_N)
 #define PC_STORE_MAG(a) ((a)[0] == 0x44 && (a)[1] == 0x50 && \
                          (a)[2] == 0x4D && (a)[3] == 0x31 && \
-                         (a)[5] >= 1 && (a)[5] <= 3)           /* "DPM1" v1..v3 */
+                         (a)[5] >= 1 && (a)[5] <= 6)           /* "DPM1" v1..v6 */
 
 static int *const pc_param[PC_STORE_N] = {
-    &digipump_on, &digipump_squash, &digipump_pump, &digipump_warm, &digipump_mix,
-    &digipump_atk, &digipump_out, &digipump_rat,
+    &hy_fold, &digifold_shape, &digifold_tone, &digifold_touch,
+    &hy_comp, &digipump_rat, &digipump_pump, &digipump_out,
 };
-static const unsigned char pc_def[PC_STORE_N] = { 0, 64, 64, 32, 127, 0, 64, 0 };
+/* FOLD OFF, SHAPE SINE, TONE OPEN, TOUCH off; COMP 80, RATIO AUTO, REL 64 (stored 127 - it), OUT 0 dB */
+static const short pc_def[PC_STORE_N] = { 0, 0, 127, 64, 80, 0, 63, 64 };
+static const short pc_max[PC_STORE_N] = { 127, 127, 127, 127, 127, 127, 127, 127 };
 static unsigned char *pc_blk;                   /* block we last synced */
 static unsigned char pc_copy[PC_STORE_LEN];
 static int pc_dirty;                            /* a page edit is pending */
@@ -148,14 +166,45 @@ static unsigned char *pc_slot(void)
     return (unsigned char *)(p + PC_STORE_OFF);
 }
 
-/* a v1 block (PUMP 1.0 .. 1.6) has the first five, v2 (1.7 .. 2.2) seven
- * (its eighth is not RAT); the rest take defaults (RAT: AUTO) */
+static int pc_get(const unsigned char *b, int i)
+{
+    return (short)((b[8 + 2 * i] << 8) | b[9 + 2 * i]);
+}
+
+static void pc_defaults(void)
+{
+    int i;
+    for (i = 0; i < PC_STORE_N; i++)
+        *pc_param[i] = pc_def[i];
+}
+
 static void pc_read(const unsigned char *b)
 {
-    int i, n = b[5] == 1 ? 5 : b[5] == 2 ? 7 : PC_STORE_N;
-    for (i = 0; i < PC_STORE_N; i++)
-        *pc_param[i] = i < n ? clampi((short)((b[8 + 2 * i] << 8) | b[9 + 2 * i]), 0, 127)
-                             : pc_def[i];
+    int i, n;
+    if (b[5] >= 6) {
+        for (i = 0; i < PC_STORE_N; i++)
+            *pc_param[i] = clampi(pc_get(b, i), 0, pc_max[i]);
+        return;
+    }
+    if (b[5] == 5) {                            /* 5.0, 5.1: BIAS and BLEND are gone */
+        for (i = 0; i < PC_STORE_N; i++)
+            *pc_param[i] = (i == 1 || i == 3) ? pc_def[i] : clampi(pc_get(b, i), 0, pc_max[i]);
+        return;
+    }
+    if (b[5] == 4) {                            /* 4.x: the compressor's four; the folder OFF */
+        pc_defaults();
+        for (i = 4; i < PC_STORE_N; i++)
+            *pc_param[i] = clampi(pc_get(b, i), 0, pc_max[i]);
+        return;
+    }
+    n = b[5] == 1 ? 5 : b[5] == 2 ? 7 : 8;      /* PUMP 1.0 .. 3.0 */
+    pc_defaults();
+    hy_comp = pc_get(b, 0) ? clampi(pc_get(b, 1), 1, 127) : 0;
+    digipump_pump = clampi(pc_get(b, 2), 0, 127);
+    if (n >= 7)
+        digipump_out = clampi(pc_get(b, 6), 0, 127);
+    if (n >= 8)
+        digipump_rat = clampi(pc_get(b, 7), 0, 127);
 }
 
 static void pc_write(unsigned char *b)
@@ -173,7 +222,9 @@ static void pc_write(unsigned char *b)
 
 /* Once a UI frame: follow a pattern switch, persist a page edit, and adopt a
  * reload the OS made behind us -- but only a block that still carries our
- * magic; anything else in it is a stock write, and we reclaim the block. */
+ * magic; anything else in it is a stock write, and we reclaim the block. A
+ * pattern that never had PUMP starts from the defaults; an older block is
+ * rewritten as v4 once read. */
 static void pc_sync(void)
 {
     unsigned char *b = pc_slot();
@@ -193,7 +244,8 @@ static void pc_sync(void)
                 if (PC_STORE_MAG(b))
                     pc_read(b);
                 else
-                    pc_write(b);
+                    pc_defaults();
+                pc_write(b);
             }
         }
     } else {
@@ -201,7 +253,8 @@ static void pc_sync(void)
         if (PC_STORE_MAG(b))
             pc_read(b);
         else
-            pc_write(b);                     /* new pattern: adopt live values */
+            pc_defaults();
+        pc_write(b);
     }
     pc_dirty = 0;
     for (i = 0; i < PC_STORE_LEN; i++)
@@ -296,14 +349,6 @@ static void dg_fill(int x0, int y0, int x1, int y1, int c)
     }
 }
 
-static void dg_frame(int x0, int y0, int x1, int y1)
-{
-    dg_fill(x0, y0, x1, y0, 1);
-    dg_fill(x0, y1, x1, y1, 1);
-    dg_fill(x0, y0, x0, y1, 1);
-    dg_fill(x1, y0, x1, y1, 1);
-}
-
 static int dg_strw(const char *s, int sc)
 {
     int w = 0;
@@ -344,23 +389,6 @@ static void dg_text(int x, int ytop, const char *s, int sc)
     }
 }
 
-static void dg_offbox(void)
-{
-    const char *s = "OFF";
-    int w = dg_strw(s, 1);
-    int x0 = (128 - (w + 12)) / 2, x1 = x0 + w + 11;
-    dg_fill(x0, 51, x1, 37, 0);
-    dg_frame(x0, 51, x1, 37);
-    dg_text((128 - w) / 2, 48, s, 1);
-}
-
-static const char *dg_pumpname(void)
-{
-    static const char *const n[3] = { "LEVEL", "GLUE", "PUMP" };
-    int b = (digipump_pump * 3) >> 7;
-    return n[b > 2 ? 2 : b];
-}
-
 /* ---- the page, in screen coordinates (m_*: x right, y down from the top of
  * the panel, as the preview was drawn; rows 0..10 are the stock title bar) ---- */
 static void m_fill(int x0, int y0, int x1, int y1, int c) { dg_fill(x0, 63 - y0, x1, 63 - y1, c); }
@@ -374,11 +402,6 @@ static void m_px(int x, int y, int c)
         dg_fb[(7 - (r >> 3)) + (x << 3)] |= (unsigned char)(1u << (r & 7));
     else
         dg_fb[(7 - (r >> 3)) + (x << 3)] &= (unsigned char)~(1u << (r & 7));
-}
-static void m_frame(int x0, int y0, int x1, int y1)
-{
-    m_fill(x0, y0, x1, y0, 1); m_fill(x0, y1, x1, y1, 1);
-    m_fill(x0, y0, x0, y1, 1); m_fill(x1, y0, x1, y1, 1);
 }
 static int m_w(const char *s) { return dg_strw(s, 1) - 1; }
 static void m_text(int x, int y, const char *s) { dg_text(x, 63 - y, s, 1); }
@@ -398,19 +421,6 @@ static void m_line(int x0, int y0, int x1, int y1)
         if (e2 <= dx) { e += dx; y0 += sy; }
     }
 }
-/* r * cos / sin of a (0..255 a turn), rounded */
-static int m_cos(int r, int a) { return (r * sin256[(a + 64) & 255] + 16384) >> 15; }
-static int m_sin(int r, int a) { return (r * sin256[a & 255] + 16384) >> 15; }
-static void m_ring(int cx, int cy, int r, int n, int gap_at, int gap)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        int a = (i * 256) / n;
-        if (gap && ((a - gap_at) & 255) < gap)
-            continue;                              /* the sheen: where light catches */
-        m_px(cx + m_cos(r, a), cy + m_sin(r, a), 1);
-    }
-}
 static void m_itoa(char *b, int v)
 {
     int n = 0;
@@ -423,16 +433,16 @@ static void m_itoa(char *b, int v)
 
 /* The animation's state, moved on by pumpctl_tick */
 #define PC_HIST 56                          /* graph: 2 px a redraw, 2.8 s */
-static unsigned pc_ang;                     /* the record's turn, Q8 of 256 a turn */
 static unsigned char pc_hist[PC_HIST];      /* gain reduction per redraw, dB */
 static int pc_hpos;
 static int pc_gr_db, pc_pk_db, pc_pk_hold;  /* the meter, its peak and hold */
-static int pc_graph;                        /* YES: the record or the graph */
+static int pc_graph;                        /* YES: 0 the controls, 1 the table, 2 the graph */
+static int pc_amp = 256;                    /* the curve's bounce, Q8 of its full height */
 
-/* SETTINGS > PUMP ANIMATION (pumpset.s): byte 0 set = still. Saved with the
- * project (core's project data, "PMPU"); on OS 1.44 a change also asks the
- * OS to refresh its power-up copy of the project, as digisnake does, so it
- * survives a power cycle. */
+/* SETTINGS > FX ANIMATION (pumpset.s): byte 0 set = still. Byte 1 was PUMP
+ * 3.0's MASTER FX (unused now). Saved with the project (core's project data,
+ * "PMPU"); on OS 1.44 a change also asks the OS to refresh its power-up copy
+ * of the project, as digisnake does, so it survives a power cycle. */
 unsigned char pumpctl_anim_off[4];
 static void pc_prefs_loaded(int32_t found) { (void)found; }   /* none: zeros, animate */
 const struct core_projdata pumpctl_projdata = {
@@ -460,12 +470,28 @@ static void pc_mirror_request(void)
 
 static int pc_db(int lu) { return lu > 0 ? (lu * 385) >> 14 : 0; }   /* lu -> dB */
 
-/* Each redraw on PUMP: the gain reduction since the last one (its peak, from
- * the render), into the meter, its peak hold and the graph. */
+/* a 24-bit peak in lu (log2 Q8), 0 = full scale; an approximation, for the page */
+static int pc_lu(int p)
+{
+    int n = 23, f;
+    if (p <= 0)
+        return -6000;
+    if (p > 0x7fffff)
+        p = 0x7fffff;
+    while (!(p & (1 << n)))
+        n--;
+    f = n >= 8 ? (p >> (n - 8)) & 255 : (p << (8 - n)) & 255;
+    return ((n - 23) << 8) + f;
+}
+
+/* Each redraw: the gain reduction since the last one (its peak, from the
+ * render), into the meter, its peak hold and the graph; and the output's
+ * level, into the curve's bounce: full height at 0 dBFS, falling with the
+ * level to 0.4 of it at -36 dB and below, dropping back at most an eighth a redraw. */
 static void pc_meter_step(void)
 {
     extern int digipump_grpk;
-    int d = digipump_on ? pc_db(digipump_grpk) : 0;
+    int d = digipump_on ? pc_db(digipump_grpk) : 0, a;
     digipump_grpk = 0;
     pc_gr_db = d;
     if (d >= pc_pk_db) {
@@ -478,9 +504,16 @@ static void pc_meter_step(void)
     }
     pc_hist[pc_hpos] = (unsigned char)(d > 255 ? 255 : d);
     pc_hpos = (pc_hpos + 1) % PC_HIST;
+    if (!digipump_owner.on) {
+        a = 256;                                /* nothing running: the curve as it is */
+    } else {
+        a = clampi(256 + pc_lu(digipump_lvl) / 10, 102, 256); /* -36 dB (1536 lu): 0.4 */
+    }
+    digipump_lvl = 0;
+    pc_amp = a >= pc_amp ? a : (pc_amp - a > 32 ? pc_amp - 32 : a);
 }
 
-/* B's meter: 12 segments of 2 dB from the top, a peak tick, the dB below */
+/* the meter: 12 segments of 2 dB from the top, a peak tick, the dB below */
 static void m_meter(void)
 {
     char b[6];
@@ -503,41 +536,13 @@ static void m_meter(void)
     m_ctext(124, 56, b);
 }
 
-/* D: the record turns with the tempo; the tonearm rides in with the gain
- * reduction (0..24 dB: 0..28 degrees) */
-static void m_record(void)
+/* RATIO in tenths (20 .. 200), as the DSP sets it: 2^(lu / 256) from its octaves and a curved
+ * fraction (within half a percent) */
+static int pc_rat_tenths(int v)
 {
-    int cx = 21, cy = 33, x, y, r, a = (int)(pc_ang >> 8) & 255;
-    int ax = 41, ay = 13, L = 25, ta, nx, ny, gr = pc_gr_db > 24 ? 24 : pc_gr_db;
-    m_ring(cx, cy, 18, 120, 0, 0);
-    m_ring(cx, cy, 14, 98, a, 29);
-    m_ring(cx, cy, 10, 70, a + 128, 20);
-    for (y = -5; y <= 5; y++)                       /* the label */
-        for (x = -5; x <= 5; x++)
-            if (x * x + y * y <= 25)
-                m_px(cx + x, cy + y, 1);
-    m_px(cx, cy, 0);
-    for (r = 2; r <= 4; r++)                        /* its stripe, turning */
-        m_px(cx + m_cos(r, a), cy + m_sin(r, a), 0);
-    ta = 77 + (gr * 20) / 24;                       /* 108 .. 136 degrees, of 256 */
-    nx = ax + m_cos(L, ta);
-    ny = ay + m_sin(L, ta);
-    m_fill(ax - 2, ay - 2, ax + 2, ay + 2, 1);
-    m_px(ax, ay, 0);
-    m_line(ax, ay, nx, ny);
-    m_fill(nx - 1, ny - 1, nx + 1, ny + 1, 1);
-    m_ctext(21, 55, "PUMP");
-}
-
-/* RAT as shown: "AUT", the ratio to :1 (whole), "LIM"; the popup in tenths */
-static int pc_rat_tenths(int v)                 /* 20 .. 200 */
-{
-    int lu = 256 + ((v - 1) * 850) / 125, r = 0;
-    /* 2^(lu/256) * 10, from the 6 dB octaves and a linear fraction: close
-     * enough for a label (the DSP uses the exact table) */
-    int n = lu >> 8, f = lu & 255;
-    r = (10 << n) + (((10 << n) * f) >> 8);
-    return r;
+    int lu = 256 + ((v - 1) * 850) / 125, n = lu >> 8, f = lu & 255;
+    int b = 4096 + ((f << 4) - (((f * (256 - f)) * 87 >> 16) << 4));
+    return ((10 << n) * b + 2048) >> 12;
 }
 
 /* OUT in tenths of a dB: 64 = 0, 0.5 dB a step below, 6/63 dB above */
@@ -546,50 +551,196 @@ static int pc_out_tenths(int v)
     return v <= 64 ? (v - 64) * 5 : ((v - 64) * 60) / 63;
 }
 
-/* The controls as the knobs sit: A..D on top, E..H below. Each cell: its
- * name, its value and a bar; OUT's bar grows from the middle (0 dB). */
-static void m_cell(int x, int y, const char *lab, int v, int bip)
+/* ---- the fold curve ------------------------------------------------------- */
+/* the chain's curve at i (0..255, the input from -1 to +1): the folder as the DSP has it (the
+ * drive as heard, TOUCH and all, the same curve), with the straight line as it fades in or out */
+static int rs_curve_at(int i)
 {
-    char b[6];
-    int cx = x + 8;
-    m_ctext(cx, y, lab);
-    if (bip == 2) {                                       /* RAT */
-        if (v == 0) { b[0] = 'A'; b[1] = 'U'; b[2] = 'T'; b[3] = 0; }
-        else if (v == 127) { b[0] = 'L'; b[1] = 'I'; b[2] = 'M'; b[3] = 0; }
-        else m_itoa(b, (pc_rat_tenths(v) + 5) / 10);
-    } else if (bip) {
-        int t = pc_out_tenths(v);                         /* whole dB, rounded */
-        m_itoa(b, (t + (t < 0 ? -5 : 5)) / 10);
-    } else {
-        m_itoa(b, v);
+    int x14 = (i * 2 - 255) * 64;                       /* -16320 .. 16320, as x24 >> 9 */
+    int g, ph, v, w;
+#ifdef PC_TEST_CURVE
+    if (1)                                  /* the emulator runs no audio: from the settings */
+#else
+    if (pc_still() || !digipump_owner.on)   /* nothing heard: from the settings */
+#endif
+    {
+        g = fd_gq[hy_fold ? hy_fold : 1];
+        w = hy_fold ? 1024 : 0;
+    } else {                                /* as the folder has them now, gliding */
+        g = digifold_gq;
+        w = digifold_wm;
     }
+    ph = (x14 * g) >> 11;
+    v = (digifold_sin[(ph >> 6) & 1023] * 255 / 32767 + 255) / 2;   /* 0 .. 255 */
+    return i + (((v - i) * w) >> 10);
+}
+
+/* the curve in a box x0..x1, y0 (top) .. y1, joined up, its height pc_amp of the box's */
+static void rs_curve(int x0, int y0, int x1, int y1)
+{
+    int w = x1 - x0, h = y1 - y0, i, py = 0, mid2 = y0 + y1;
+#ifdef PC_TEST_CURVE
+    int amp = 192;
+#else
+    int amp = pc_still() ? 256 : pc_amp;
+#endif
+    for (i = 0; i <= w; i++) {
+        int c = rs_curve_at((i * 255) / w) * 2 - 255;       /* -255 .. 255 */
+        int y = (mid2 - (c * h * amp) / (255 * 256)) / 2;
+        if (i)
+            m_line(x0 + i - 1, py, x0 + i, y);
+        else
+            m_px(x0, y, 1);
+        py = y;
+    }
+}
+
+/* the small screen: a rounded frame, a dotted centre line, the curve */
+static void rs_screen(int x0, int y0, int x1, int y1)
+{
+    int x;
+    m_fill(x0 + 2, y0, x1 - 2, y0, 1); m_fill(x0 + 2, y1, x1 - 2, y1, 1);
+    m_fill(x0, y0 + 2, x0, y1 - 2, 1); m_fill(x1, y0 + 2, x1, y1 - 2, 1);
+    m_px(x0 + 1, y0 + 1, 1); m_px(x1 - 1, y0 + 1, 1);
+    m_px(x0 + 1, y1 - 1, 1); m_px(x1 - 1, y1 - 1, 1);
+    if (!hy_fold) {                         /* FOLD OFF: OFF, no curve */
+        m_ctext((x0 + x1) / 2, (y0 + y1) / 2 - 3, "OFF");
+        return;
+    }
+    for (x = x0 + 3; x < x1 - 1; x += 3)
+        m_px(x, (y0 + y1) / 2, 1);
+    rs_curve(x0 + 2, y0 + 2, x1 - 2, y1 - 2);
+}
+
+/* little string helpers for the cells and the drop-downs */
+static void rs_cat(char *b, const char *t) { while (*b) b++; while (*t) *b++ = *t++; *b = 0; }
+static void rs_signed(char *b, int v)        /* "+12", "0", "-6" */
+{
+    if (v > 0) { b[0] = '+'; m_itoa(b + 1, v); } else m_itoa(b, v);
+}
+
+/* ---- the controls --------------------------------------------------------- */
+/* the knob's value, 0..its maximum (REL: the knob, 127 - the stored value) */
+static int hy_get(int id)
+{
+    switch (id) {
+    case 1: return hy_fold;
+    case 2: return digifold_shape;
+    case 3: return digifold_tone;
+    case 4: return digifold_touch;
+    case 5: return hy_comp;
+    case 6: return digipump_rat;
+    case 7: return 127 - digipump_pump;
+    default: return digipump_out;
+    }
+}
+
+static void hy_set(int id, int v)
+{
+    switch (id) {
+    case 1: hy_fold = clampi(v, 0, 127); break;
+    case 2: digifold_shape = clampi(v, 0, 127); break;
+    case 3: digifold_tone = clampi(v, 0, 127); break;
+    case 4: digifold_touch = clampi(v, 0, 127); break;
+    case 5: hy_comp = clampi(v, 0, 127); break;
+    case 6: digipump_rat = clampi(v, 0, 127); break;
+    case 7: digipump_pump = 127 - clampi(v, 0, 127); break;
+    default: digipump_out = clampi(v, 0, 127); break;
+    }
+}
+
+static const char *dg_pumpname(void)
+{
+    static const char *const n[3] = { "LEVEL", "GLUE", "PUMP" };
+    int b = (digipump_pump * 3) >> 7;
+    return n[b > 2 ? 2 : b];
+}
+
+/* SHAPE: the curve nearest the knob */
+static int hy_shape_near(void)
+{
+    int n, best = 0;
+    for (n = 1; n < FD_SHAPES; n++) {
+        int d = digifold_shape - fd_shape_pt[n], e = digifold_shape - fd_shape_pt[best];
+        if (d * d < e * e)
+            best = n;
+    }
+    return best;
+}
+
+/* the values as the cells show them (short); the drop-downs say them in full */
+static void hy_cellval(char *b, int id)
+{
+    int v;
+    b[0] = 0;
+    switch (id) {
+    case 1:                                         /* FOLD: OFF, 1..127 */
+        if (!hy_fold) rs_cat(b, "OFF"); else m_itoa(b, hy_fold);
+        return;
+    case 2:                                         /* SHAPE: the nearest curve's name */
+        rs_cat(b, fd_shape_name[hy_shape_near()]);
+        return;
+    case 3:                                         /* TONE: "500Hz", "4.8K", "12K", OPEN */
+        v = fd_tone_hz10[digifold_tone];            /* Hz / 10 */
+        if (digifold_tone >= 127) rs_cat(b, "OPEN");
+        else if (v < 100) { m_itoa(b, v * 10); rs_cat(b, "Hz"); }
+        else if (v < 1000) { b[0] = (char)('0' + v / 100); b[1] = '.';
+                             b[2] = (char)('0' + (v / 10) % 10); b[3] = 'K'; b[4] = 0; }
+        else { m_itoa(b, (v + 50) / 100); rs_cat(b, "K"); }
+        return;
+    case 4:                                         /* TOUCH: -64 .. +63, OFF in the middle */
+        if (digifold_touch == 64) rs_cat(b, "OFF"); else rs_signed(b, digifold_touch - 64);
+        return;
+    case 5:                                         /* COMP: OFF, 1..127 */
+        if (!hy_comp) rs_cat(b, "OFF"); else m_itoa(b, hy_comp);
+        return;
+    case 6:                                         /* RATIO: AUT, 2:1 .. 20:1, LIM */
+        if (!digipump_rat) rs_cat(b, "AUT");
+        else if (digipump_rat >= 127) rs_cat(b, "LIM");
+        else { m_itoa(b, (pc_rat_tenths(digipump_rat) + 5) / 10); rs_cat(b, ":1"); }
+        return;
+    case 7:
+        m_itoa(b, 127 - digipump_pump);
+        return;
+    default:                                        /* OUT: whole dB, signed */
+        v = pc_out_tenths(digipump_out);
+        rs_signed(b, (v + (v < 0 ? -5 : 5)) / 10);
+        rs_cat(b, "dB");
+        return;
+    }
+}
+
+static const char *const hy_lab[8] = { "FOLD", "SHAPE", "TONE", "TOUCH", "COMP", "RATIO", "REL", "OUT" };
+
+/* a cell: its name, its value and a bar (OUT's and TOUCH's grow from the middle) */
+static void hy_cell(int x, int y, int id)
+{
+    char b[8];
+    int cx = x + 8, v = hy_get(id), vmax = 127;
+    m_ctext(cx, y, hy_lab[id - 1]);
+    hy_cellval(b, id);
     m_ctext(cx, y + 8, b);
-    m_fill(x, y + 18, x + 16, y + 18, 1);                 /* the track */
-    if (bip == 1) {
+    m_fill(x, y + 18, x + 16, y + 18, 1);          /* the track */
+    if (id == 8 || id == 4) {                       /* OUT and TOUCH: from the middle */
         int c = x + 8, e = x + 8 + ((v - 64) * 8) / 64;
         m_fill(c, y + 16, e, y + 18, 1);
-        m_fill(c, y + 16, c, y + 19, 1);                  /* the centre */
+        m_fill(c, y + 16, c, y + 19, 1);
     } else {
-        m_fill(x, y + 16, x + (v * 16) / 127, y + 18, 1);
+        m_fill(x, y + 16, x + (v * 16) / vmax, y + 18, 1);
     }
 }
 
-static void m_sliders(void)
+static void hy_cells(void)
 {
-    int x0 = 45, dx = 19;
-    m_ctext(x0 + 8, 13, "PMP");
-    m_ctext(x0 + 8, 21, digipump_on ? "ON" : "OFF");
-    m_cell(x0 + dx, 13, "ATK", digipump_atk, 0);
-    m_cell(x0 + 2 * dx, 13, "OUT", digipump_out, 1);
-    m_cell(x0 + 3 * dx, 13, "RAT", digipump_rat, 2);
-    m_cell(x0, 37, "CMP", digipump_squash, 0);
-    m_cell(x0 + dx, 37, "REL", 127 - digipump_pump, 0);  /* the knob: more is slower */
-    m_cell(x0 + 2 * dx, 37, "WRM", digipump_warm, 0);
-    m_cell(x0 + 3 * dx, 37, "MIX", digipump_mix, 0);
+    int x0 = 32, dx = 23, i;                    /* room between the five-letter names */
+    for (i = 0; i < 4; i++) {
+        hy_cell(x0 + i * dx, 13, i + 1);
+        hy_cell(x0 + i * dx, 37, i + 5);
+    }
 }
 
-/* C: the last 2.8 s of gain reduction, hanging from the top line; dotted
- * lines at 6, 12 and 18 dB */
+/* the last 2.8 s of gain reduction, hanging from the top line; dotted lines at 6, 12 and
+ * 18 dB; the compressor's settings under it */
 static void m_graph(void)
 {
     char b[8];
@@ -604,31 +755,34 @@ static void m_graph(void)
         m_fill(1 + 2 * i, 12, 2 + 2 * i, 12 + (d * 34) / 24, 1);
     }
     x = 1;
-    m_text(x, 55, "CMP"); x += m_w("CMP") + 3;
-    m_itoa(b, digipump_squash); m_text(x, 55, b); x += m_w(b) + 6;
-    m_text(x, 55, "REL"); x += m_w("REL") + 3;
-    m_itoa(b, 127 - digipump_pump); m_text(x, 55, b); x += m_w(b) + 6;
-    m_text(x, 55, "WRM"); x += m_w("WRM") + 3;
-    m_itoa(b, digipump_warm); m_text(x, 55, b);
+    for (i = 5; i <= 7; i++) {
+        m_text(x, 55, hy_lab[i - 1]); x += m_w(hy_lab[i - 1]) + 3;
+        hy_cellval(b, i); m_text(x, 55, b); x += m_w(b) + 6;
+    }
 }
 
 static void pc_page(void *bmp)
 {
+    char b[8];
     (void)bmp;
     dg_fill(0, 0, 127, DG_TOP - 1, 0);
-    if (pc_still()) {                           /* STILL: no animation */
-        dg_text(4, 63 - 30, "PUMP", 2);
-        m_sliders();
-    } else if (pc_graph) {
-        m_graph();
-    } else {
-        m_record();
-        m_sliders();
+    if (!pc_still() && pc_graph == 1) {             /* YES: the curve, big */
+        rs_screen(1, 12, 126, 54);
+        hy_cellval(b, 1);
+        m_text(2, 56, "GESTALT");
+        m_rtext(126, 56, b);
+        return;
     }
-    if (!pc_still())                            /* no meter when still: nothing moves */
+    if (!pc_still() && pc_graph == 2) {             /* YES again: the graph */
+        m_graph();
         m_meter();
-    if (!digipump_on)
-        dg_offbox();
+        return;
+    }
+    rs_screen(1, 13, 27, 50);
+    m_text(0, 57, "GESTALT");               /* under the screen, below the COMP bar */
+    hy_cells();
+    if (!pc_still())                                /* no meter when still: nothing moves */
+        m_meter();
 }
 
 /* vtable slot 4 of the master view: draw */
@@ -650,14 +804,21 @@ void pumpctl_mdraw(void *view, void *bmp)
         pc_page(bmp);
 }
 
-/* Every UI frame: storage, and a redraw every pc_rate frames while the master
- * view is on screen (20 fps on PUMP, so the record, the arm and the meter move smoothly).
- * Leaving the view stops the draws, pc_vis runs out and we disarm. */
+/* Every UI frame: storage, the page's two into the DSP's, and a redraw every pc_rate frames
+ * while the master view is on screen (20 fps on our page). Leaving the view stops the draws,
+ * pc_vis runs out and we disarm. */
 void pumpctl_tick(void *ctrl)
 {
+    int ours;
     (void)ctrl;
     pc_sync();
-    if (pumpctl_anim_off[0] != pc_anim_last) {     /* SETTINGS changed it */
+    digipump_on = hy_comp > 0;
+    if (hy_comp > 0)
+        digipump_squash = hy_comp;
+    digifold_active = hy_fold > 0;
+    if (hy_fold > 0)
+        digifold_amt = hy_fold;
+    if (pumpctl_anim_off[0] != pc_anim_last) {   /* SETTINGS changed it */
         pc_anim_last = pumpctl_anim_off[0];
         pc_save_wait = PC_SAVE_TICKS;
     }
@@ -671,17 +832,13 @@ void pumpctl_tick(void *ctrl)
     }
     if (pc_vis)
         pc_vis--;
-    /* the record: a turn a bar (4 beats) while the sequencer plays. A tick is
-     * 1/60 s; fw_tempo is BPM x 120, so a tick turns BPM / 14400 of a turn:
-     * fw_tempo / 1728000, here in Q16 of a turn (65536 = a turn). */
-    if (fw_transport == 1 && fw_tempo > 0)
-        pc_ang += ((unsigned)fw_tempo * 2485u) >> 16;
+    ours = pc_vis > 0 && pc_view_open(pc_view) && pc_cur_kind(pc_view) == PC_KIND;
+    digipump_meter = ours && !pc_still();   /* the output's level: only while it is shown */
     if (pc_vis > 0 && pc_view_open(pc_view)) {
         if (++pc_ctr >= pc_rate) {
             pc_ctr = 0;
-            if (pc_cur_kind(pc_view) == PC_KIND) {
+            if (ours)
                 pc_meter_step();
-            }
             DN_INVALIDATE(pc_view);
         }
     } else if (pc_view && !pc_view_open(pc_view)) {
@@ -703,21 +860,93 @@ static int pc_steps(int id, int d)
 
 /* a value moved d detents: one a detent, or with the knob held down, from
  * multiple of 8 to multiple of 8 (61 -> 64 -> 72; 0 .. 127) */
-static int pc_fast;
-static int pc_move(int v, int d)
+static int pc_move(int v, int d, int fast)
 {
-    if (pc_fast)
+    if (fast)
         v = d > 0 ? ((v / PC_FAST) + d) * PC_FAST : (((v + PC_FAST - 1) / PC_FAST) + d) * PC_FAST;
     else
         v += d;
     return clampi(v, 0, 127);
 }
 
+/* the knobs' stock-style drop-downs */
+static void hy_popup(int id)
+{
+    int v, a;
+    char b[12];
+    b[0] = 0;
+    switch (id) {
+    case 1:
+        if (!hy_fold) PC_POPUP("Fold=OFF"); else PC_POPUP("Fold=%d", hy_fold);
+        break;
+    case 2: a = hy_shape_near();
+        if (digifold_shape == fd_shape_pt[a]) PC_POPUP("Shape=%s", fd_shape_name[a]);
+        else {
+            int n = digifold_shape > fd_shape_pt[a] ? a : a - 1;
+            PC_POPUP("Shape=%s>%s", fd_shape_name[n], fd_shape_name[n + 1]);
+        }
+        break;
+    case 3: v = fd_tone_hz10[digifold_tone];
+        if (digifold_tone >= 127) PC_POPUP("Tone=OPEN");
+        else if (v < 100) PC_POPUP("Tone=%dHz", v * 10);
+        else PC_POPUP("Tone=%d.%dkHz", v / 100, (v / 10) % 10);
+        break;
+    case 4: hy_cellval(b, 4); PC_POPUP("Touch=%s", b); break;
+    case 5:
+        if (!hy_comp) PC_POPUP("Comp=OFF"); else PC_POPUP("Comp=%d", hy_comp);
+        break;
+    case 6:
+        if (!digipump_rat) PC_POPUP("Ratio=AUTO");
+        else if (digipump_rat >= 127) PC_POPUP("Ratio=LIMIT");
+        else {
+            int r = pc_rat_tenths(digipump_rat);
+            if (r < 100) PC_POPUP("Ratio=%d.%d:1", r / 10, r % 10);
+            else PC_POPUP("Ratio=%d:1", (r + 5) / 10);
+        }
+        break;
+    case 7: PC_POPUP("Release=%s %d", dg_pumpname(), 127 - digipump_pump); break;
+    default:
+        v = pc_out_tenths(digipump_out); a = v < 0 ? -v : v;
+        PC_POPUP("Out=%c%d.%ddB", v < 0 ? '-' : '+', a / 10, a % 10);
+        break;
+    }
+}
+
+/* FUNC + turn: to the next of the knob's snap points that way (on the knob's value) */
+static const unsigned char hy_snap_comp[] = { 0, 32, 64, 80, 96, 127 };
+static const unsigned char hy_snap_rat[] = { 0, 1, 23, 39, 76, 88, 126, 127 };  /* AUTO, 2:1, 3:1, 4:1, 8:1, 10:1, 20:1, LIMIT */
+static const unsigned char hy_snap_fold[] = { 0, 16, 32, 48, 64, 80, 96, 112, 127 };
+static const unsigned char hy_snap_touch[] = { 0, 32, 48, 64, 80, 96, 127 };    /* -64, -32, -16, OFF, +16, +32, +63 */
+static const unsigned char hy_snap_rel[] = { 0, 32, 64, 96, 127 };
+static const unsigned char hy_snap_out[] = { 16, 40, 52, 58, 64, 96, 127 };     /* -24, -12, -6, -3, 0, +3, +6 dB */
+static const unsigned char *const hy_snaps[9] = {
+    0, hy_snap_fold, fd_shape_pt, fd_snap_tone, hy_snap_touch, hy_snap_comp, hy_snap_rat, hy_snap_rel, hy_snap_out,
+};
+static const unsigned char hy_nsnaps[9] = {
+    0, sizeof hy_snap_fold, sizeof fd_shape_pt, sizeof fd_snap_tone, sizeof hy_snap_touch, sizeof hy_snap_comp,
+    sizeof hy_snap_rat, sizeof hy_snap_rel, sizeof hy_snap_out,
+};
+static int hy_snap(int id, int v, int d)
+{
+    const unsigned char *p = hy_snaps[id];
+    int i, n = hy_nsnaps[id];
+    if (d > 0) {
+        for (i = 0; i < n; i++)
+            if (p[i] > v)
+                return p[i];
+    } else {
+        for (i = n - 1; i >= 0; i--)
+            if (p[i] < v)
+                return p[i];
+    }
+    return v;
+}
+
 int pumpctl_enc(void *brain, void *ev)
 {
     int id = *(int *)((char *)ev + 12);
     int delta = *(int *)((char *)ev + 16);
-    int d;
+    int d, v, fast;
     (void)brain;
     if (id < 1 || id > 8 || !pc_live() || pc_cur_kind(pc_view) != PC_KIND)
         return 0;                        /* not ours (LEVEL/DATA included, so FUNC +
@@ -728,61 +957,54 @@ int pumpctl_enc(void *brain, void *ev)
     d = pc_steps(id, delta);
     if (!d)
         return 1;
-    if (pc_func)
-        d = d > 0 ? 127 : -127;          /* FUNC + turn: snap to 100% / 0% */
-    pc_fast = !pc_func && pc_push[id - 1];   /* press + turn: snaps to 8s, as on the
-                                          * stock pages */
-    switch (id) {               /* the edit, and the stock Name=value message */
-    case 1:
-        digipump_on = (d > 0);
-        PC_POPUP("Pump=%s", digipump_on ? "ON" : "OFF");
-        break;
-    case 2:
-        digipump_atk = pc_move(digipump_atk, d);
-        PC_POPUP("Attack=%d", digipump_atk);
-        break;
-    case 4:
-        digipump_rat = pc_move(digipump_rat, d);
-        if (digipump_rat == 0)
-            PC_POPUP("Ratio=AUTO");
-        else if (digipump_rat == 127)
-            PC_POPUP("Ratio=LIMIT");
-        else {
-            int r = pc_rat_tenths(digipump_rat);
-            PC_POPUP("Ratio=%d.%d:1", r / 10, r % 10);
-        }
-        break;
-    case 3:
-        digipump_out = pc_move(digipump_out, d);
-        {
-            int t = pc_out_tenths(digipump_out), a = t < 0 ? -t : t;
-            PC_POPUP("Out=%c%d.%ddB", t < 0 ? '-' : '+', a / 10, a % 10);
-        }
-        break;
-    case 5:
-        digipump_squash = pc_move(digipump_squash, d);
-        PC_POPUP("Comp=%d", digipump_squash);
-        break;
-    case 6:
-        /* the knob is 127 - the stored value (2.11: more is slower, as the
-         * stock REL; stored as 2.10 kept it, so saved patterns sound the same) */
-        digipump_pump = 127 - pc_move(127 - digipump_pump, d);
-        PC_POPUP("Release=%s %d", dg_pumpname(), 127 - digipump_pump);
-        break;
-    case 7:
-        digipump_warm = pc_move(digipump_warm, d);
-        PC_POPUP("Warmth=%d", digipump_warm);
-        break;
-    case 8:
-        digipump_mix = pc_move(digipump_mix, d);
-        PC_POPUP("Mix=%d", digipump_mix);
-        break;
-    default:
+    fast = !pc_func && pc_push[id - 1];  /* press + turn: big steps, as on the stock pages */
+    v = hy_get(id);
+    if (pc_func) {                /* FUNC + turn: the next snap point */
+        v = hy_snap(id, v, d > 0 ? 1 : -1);
+    } else {
+        v = pc_move(v, d, fast);
+    }
+    hy_set(id, v);
+    hy_popup(id);
+    pc_act_id = id;
+    pc_act_ttl = DC_ACT_TICKS;
+    pc_dirty = 1;
+    DN_INVALIDATE(pc_view);
+    return 1;
+}
+
+/* Copy, paste, clear: FUNC + REC, STOP or PLAY (or a page key, TRIG .. LFO,
+ * held instead of FUNC). On our page the stock had nothing to copy ("COPY
+ * PAGE NONE"); here it is our eight settings, with a drop-down saying what was
+ * done. */
+#define DN_K_REC   10
+#define DN_K_PLAY  11
+#define DN_K_STOP  12
+#define DN_K_PAGE0 20                   /* TRIG; SYN1, SYN2, FLTR, AMP, LFO to 25 */
+static unsigned char pc_page_held[6];
+static int pc_clip[PC_STORE_N], pc_clip_have;
+
+static int pc_copypaste(int key)
+{
+    int i;
+    if (key == DN_K_REC) {
+        for (i = 0; i < PC_STORE_N; i++)
+            pc_clip[i] = *pc_param[i];
+        pc_clip_have = 1;
+        PC_POPUP("GESTALT settings copied");
         return 1;
     }
-    if (id >= 2) {
-        pc_act_id = id;
-        pc_act_ttl = DC_ACT_TICKS;
+    if (key == DN_K_STOP) {
+        if (!pc_clip_have) {
+            PC_POPUP("Nothing to paste");
+            return 1;
+        }
+        for (i = 0; i < PC_STORE_N; i++)
+            *pc_param[i] = pc_clip[i];
+        PC_POPUP("GESTALT settings pasted");
+    } else {
+        pc_defaults();
+        PC_POPUP("GESTALT settings cleared");
     }
     pc_dirty = 1;
     DN_INVALIDATE(pc_view);
@@ -790,37 +1012,58 @@ int pumpctl_enc(void *brain, void *ev)
 }
 
 /* FUNC is tracked (never consumed). LEFT / RIGHT rotate the master page list,
- * stock pages and ours, while the master view is open. Nothing else is taken. */
+ * stock pages and ours, while the master view is open. On our page, FUNC (or a
+ * page key) + REC / STOP / PLAY copies, pastes, clears (above); YES cycles the
+ * views. Nothing else is taken. */
 int pumpctl_key(void *brain, void *ev)
 {
     int id = *(int *)((char *)ev + 12);
     int flags = *(int *)((char *)ev + 16);
     int *v, n, i;
     (void)brain;
-    if (id >= DN_K_PUSH_A && id < DN_K_PUSH_A + 8) {   /* followed always, never taken */
+    /* FUNC, the knobs' presses and the page keys are followed always, whatever is on screen,
+     * and never taken: a release while a drop-down hid the page (4.0) left FUNC held, and
+     * PLAY / STOP were taken as paste / clear */
+    if (id >= DN_K_PUSH_A && id < DN_K_PUSH_A + 8) {
         pc_push[id - DN_K_PUSH_A] = (unsigned char)((flags & 1) != 0);
         return 0;
     }
-    if (!pc_live())
-        return 0;
     if (id == DN_K_FUNC) {
         pc_func = (flags & 1) != 0;
         return 0;
     }
+    if (id >= DN_K_PAGE0 && id < DN_K_PAGE0 + 6) {
+        pc_page_held[id - DN_K_PAGE0] = (unsigned char)((flags & 1) && !(flags & 0x10));
+        return 0;
+    }
+    if (!pc_live())
+        return 0;
+    if ((id == DN_K_REC || id == DN_K_STOP || id == DN_K_PLAY) &&
+        pc_cur_kind(pc_view) == PC_KIND) {
+        int held = pc_func || (flags & 2);
+        for (n = 0; n < 6; n++)
+            held |= pc_page_held[n];
+        if (held) {
+            if ((flags & 1) && !(flags & 0x10) && !(flags & 8))
+                return pc_copypaste(id);
+            return 1;                    /* its release and repeats: ours too */
+        }
+    }
     if (id == DN_K_YES && pc_func)
         return 0;                        /* FUNC + YES: the stock's (TEMP SAVE), 2.12 */
-    if (id == DN_K_YES && pc_cur_kind(pc_view) == PC_KIND) {   /* RECORD, GRAPH */
+    if (id == DN_K_YES && pc_cur_kind(pc_view) == PC_KIND) {   /* the views */
         if ((flags & 1) && !(flags & 0x10) && !(flags & 8)) {
             if (pc_still()) {
                 PC_POPUP("Animation off: SETTINGS");
             } else {
-                pc_graph = !pc_graph;
-                PC_POPUP("View=%s", pc_graph ? "GRAPH" : "RECORD");
+                static const char *const vn[3] = { "CONTROLS", "CURVE", "GRAPH" };
+                pc_graph = (pc_graph + 1) % 3;
+                PC_POPUP("View=%s", vn[pc_graph]);
                 pc_ctr = 0;
                 DN_INVALIDATE(pc_view);
             }
         }
-        return 1;                        /* YES's other events on PUMP: ours too */
+        return 1;                        /* YES's other events on our page: ours too */
     }
     if (id != DN_K_LEFT && id != DN_K_RIGHT)
         return 0;
